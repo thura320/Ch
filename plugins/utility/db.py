@@ -1,453 +1,374 @@
-import random
-import string
-from motor.motor_asyncio import AsyncIOMotorClient
+import telebot
+from telebot import types
+import json
 from datetime import datetime, timedelta
-import asyncio
+import os
 
+# Bot token and owner ID (replace OWNER_ID with your Telegram user ID)
+TOKEN = "7939685234:AAEQkhe191nzbeqRSlVvHj0rxXV7B9lMgGo"
+OWNER_ID = 6473717870  # replace with your Telegram ID
 
-# Use direct connection format instead of SRV
-client = AsyncIOMotorClient('mongodb+srv://niteenyadav76:j9zgiqijgHsmqtzb@cluster0.npz50f1.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0')
+# Database file path
+DB_FILE = 'db.txt'
 
-db = client['telegram_bot']
-# Your collection definitions...
-users_collection = db['users']
-authorized_users_collection = db['authorized_users']
-groups_collection = db['authorized_groups']
-keys_collection = db['keys']
-skpk_keys_collection = db['skpk_keys']
-gateways_collection = db['gateways']
+def load_data():
+    """Load data from the database file (create default structure if missing)."""
+    with db_lock:
+        if not os.path.exists(DB_FILE):
+            data = {"users": [], "keys": [], "gateways": []}
+            with open(DB_FILE, 'w') as f:
+                json.dump(data, f)
+            return data
+        try:
+            with open(DB_FILE, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            # Initialize if file is empty or corrupt
+            data = {"users": [], "keys": [], "gateways": []}
+    # Check expiry after loading (outside lock to avoid deadlocks)
+    check_expiry(data)
+    return data
 
-OWNER_ID = 1667886379  # Owner's ID
-DEFAULT_CREDITS = 0  # Default credits for new users
+def save_data(data):
+    """Save the in-memory data back to the file."""
+    with db_lock:
+        with open(DB_FILE, 'w') as f:
+            json.dump(data, f, indent=4, default=str)
 
-async def add_or_update_skpk(sk_live, pk_live):
+def find_user(data, user_id):
+    """Return the user dict for the given user_id, or None if not found."""
+    for user in data["users"]:
+        if user["user_id"] == user_id:
+            return user
+    return None
 
-    
-    # Delete the existing document with the same SK
-    delete_result = await skpk_keys_collection.delete_many({})
-    
-    result = await skpk_keys_collection.insert_one({"sk": sk_live, "pk": pk_live})
-    new_doc = await skpk_keys_collection.find_one({"sk": sk_live})
-    
-    return "SK and PK replaced successfully."
-
-
-# Method to fetch SK/PK
-async def get_skpk():
-
-    skpk = await skpk_keys_collection.find_one({})
-    
-    if skpk:
-        return skpk["sk"], skpk["pk"]
-    else:
-        return "SK not found." , "PK not found."
-async def ensure_owner_is_authorized():
-    if not await authorized_users_collection.find_one({"id": OWNER_ID}):
-        await authorized_users_collection.insert_one({
-            "id": OWNER_ID,
-            "role": "owner",
-            "credits": 1000,
-            "expiry": None,
-            "rank": "dev"
-        })
-
-
-async def register_user(user_id, username, first_name, last_name, credits=DEFAULT_CREDITS):
-    if not await users_collection.find_one({"user_id": user_id}):
-        user_data = {
+def register_user(data, user_id):
+    """Add a new user with default settings if not already present."""
+    if find_user(data, user_id) is None:
+        user = {
             "user_id": user_id,
-            "username": username,
-            "first_name": first_name,
-            "last_name": last_name,
-            "credits": credits,
             "role": "free",
-            "rank": "Free user",
-            "registered_at": datetime.now()
+            "credits": 0,
+            "expiry": None  # no expiry by default
         }
-        await users_collection.insert_one(user_data)
+        data["users"].append(user)
+        save_data(data)
         return True
     return False
 
-async def add_owner(user_id):
-    """
-    Adds a user as an owner.
-    """
-    # Check if the user is already an owner
-    existing_owner = await authorized_users_collection.find_one({"id": user_id, "role": "owner"})
-    if existing_owner:
-        return f"User {user_id} is already an owner."
-    
-    # Update or insert the user as an owner
-    await authorized_users_collection.update_one(
-        {"id": user_id},
-        {"$set": {"role": "owner", "rank": "Owner", "credits": DEFAULT_CREDITS, "expiry": None}},
-        upsert=True
-    )
-    return f"User {user_id} has been added as an owner."
-
-async def remove_owner(user_id):
-    """
-    Removes a user from the owner role.
-    """
-    # Prevent the removal of the primary OWNER_ID
-    if user_id == OWNER_ID:
-        return "You cannot remove the primary owner."
-    
-    result = await authorized_users_collection.update_one(
-        {"id": user_id, "role": "owner"},
-        {"$set": {"role": "free", "rank": "Free user"}}
-    )
-    
-    if result.matched_count == 0:
-        return f"User {user_id} is not an owner."
-    
-    return f"User {user_id} has been removed from the owner role."
-async def is_user_owner(user_id):
-    user = await authorized_users_collection.find_one({"id": user_id})
+def set_user_role(data, user_id, role, expiry_days=None):
+    """Set a user's role, optionally with an expiry from now."""
+    user = find_user(data, user_id)
     if user:
-        return user.get("role") == "owner"
+        user["role"] = role
+        if expiry_days:
+            expiry_date = datetime.now() + timedelta(days=expiry_days)
+            user["expiry"] = expiry_date.strftime("%Y-%m-%d")
+        else:
+            user["expiry"] = None
+        save_data(data)
+        return True
     return False
-async def is_group_authorized(group_id):
-    """
-    Check if a group is authorized.
-    
-    Args:
-        group_id: The ID of the group to check.
-        
-    Returns:
-        bool: True if the group is authorized, False otherwise.
-    """
-    group = await groups_collection.find_one({"id": group_id})
-    return bool(group)
-async def get_all_user_ids():
-    return [user['user_id'] for user in await users_collection.find({}).to_list(length=None)]
 
-async def get_user_expiry(user_id):
-    user = await authorized_users_collection.find_one({"id": user_id})
-    return user.get("expiry") if user and user.get("expiry") else None
+def add_credits(data, user_id, amount):
+    """Add credits to a user."""
+    user = find_user(data, user_id)
+    if user:
+        user["credits"] += amount
+        save_data(data)
+        return True
+    return False
 
-async def is_user_registered(user_id):
-    return bool(await users_collection.find_one({"user_id": user_id}))
+def subtract_credits(data, user_id, amount):
+    """Subtract credits from a user (if they have enough)."""
+    user = find_user(data, user_id)
+    if user and user["credits"] >= amount:
+        user["credits"] -= amount
+        save_data(data)
+        return True
+    return False
 
-async def give_credits(user_id, credits):
-    """
-    Adds a specified number of credits to a user's account.
-    """
-    # Retrieve the user from the authorized_users_collection
-    user = await authorized_users_collection.find_one({"id": user_id})
-    
-    if not user:
-        return f"User {user_id} not found."
+def generate_key_pair():
+    """Generate a random SK/PK key pair (16-character alphanumeric)."""
+    import random, string
+    sk = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+    pk = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(16))
+    return sk, pk
 
-    # Retrieve the user's current credits and ensure it is treated as an integer
-    current_credits = user.get("credits", 0)
+def add_key(data, sk, pk, expiry_days=None):
+    """Add a new key entry with SK and PK. Optionally set expiry days."""
+    key = {
+        "sk": sk,
+        "pk": pk,
+        "claimed_by": None,
+        "status": "active",
+        "expiry": None
+    }
+    if expiry_days:
+        expiry_date = datetime.now() + timedelta(days=expiry_days)
+        key["expiry"] = expiry_date.strftime("%Y-%m-%d")
+    data["keys"].append(key)
+    save_data(data)
+    return key
 
-    # Calculate the new credit total
-    new_credit_count = current_credits + credits
+def find_key_by_pk(data, pk):
+    """Find a key dict by its public key (pk)."""
+    for key in data["keys"]:
+        if key["pk"] == pk:
+            return key
+    return None
 
-    # Update the user's credit count in the database
-    await authorized_users_collection.update_one(
-        {"id": user_id}, 
-        {"$set": {"credits": new_credit_count}}
-    )
+def claim_key(data, user_id, pk):
+    """Claim a key (by public key) for a user."""
+    key = find_key_by_pk(data, pk)
+    user = find_user(data, user_id)
+    if key and user:
+        if key["status"] != "active":
+            return False, "Key is not active."
+        if key["claimed_by"] is not None:
+            return False, "Key has already been claimed."
+        key["claimed_by"] = user_id
+        key["status"] = "claimed"
+        save_data(data)
+        return True, f"Key {pk} has been claimed by user {user_id}."
+    return False, "Key not found or user invalid."
 
-    # Return a message with the updated credit balance
-    return f"Gave {credits} credits to user {user_id}. They now have {new_credit_count} credits."
+def add_gateway(data, name, category):
+    """Add a new gateway entry. Gateways have an auto-incremented ID."""
+    gateway_id = len(data["gateways"]) + 1
+    gateway = {
+        "id": gateway_id,
+        "name": name,
+        "category": category,
+        "status": "active"
+    }
+    data["gateways"].append(gateway)
+    save_data(data)
+    return gateway
 
+def find_gateway(data, gateway_id):
+    """Return the gateway dict with the given ID."""
+    for gw in data["gateways"]:
+        if gw["id"] == gateway_id:
+            return gw
+    return None
 
-async def update_credits(user_id, credit_change):
-    """
-    Update user's credits by adding/subtracting the specified credit change.
-    `credit_change` can be a positive or negative integer.
-    """
-    user = await authorized_users_collection.find_one({"id": user_id})
-    if not user:
-        return f"User {user_id} not found."
-    
-    current_credits = user.get("credits", 0)
-    new_credits = current_credits + credit_change  # Adjust the credits by the provided change
+def set_gateway_status(data, gateway_id, status):
+    """Set a gateway's status (e.g., active/inactive)."""
+    gw = find_gateway(data, gateway_id)
+    if gw:
+        gw["status"] = status
+        save_data(data)
+        return True
+    return False
 
-    # Ensure that the credits do not go below zero
-    if new_credits < 0:
-        new_credits = 0
+def list_gateways(data, category=None):
+    """List all gateways, or only those in a given category."""
+    if category:
+        return [gw for gw in data["gateways"] if gw["category"].lower() == category.lower()]
+    return data["gateways"]
 
-    await authorized_users_collection.update_one(
-        {"id": user_id}, 
-        {"$set": {"credits": new_credits}}
-    )
-    
-    return new_credits
-
-async def get_user_credits(user_id):
-    user = await authorized_users_collection.find_one({"id": user_id})
-    return user.get("credits", 0) if user else 0
-
-async def show_credits(user_id):
-    if not await is_user_authorized(user_id):
-        return "You are not authorized."
-
-    user = await authorized_users_collection.find_one({"id": user_id})
-    return f"You have {user.get('credits', 0)} credits remaining. Your rank is {user.get('rank', 'free')}."
-
-async def is_user_admin(user_id):
-    user = await authorized_users_collection.find_one({"id": user_id})
-    return user and user.get("role") in ["admin", "owner"]
-
-async def generate_key(duration):
-    key_format = f"B3XAYAN-{generate_random_string(5)}-{generate_random_string(3)}"
-    expiry_time = parse_duration(duration)
-
-    if not expiry_time:
-        return "Invalid duration format."
-
-    await keys_collection.insert_one({"key": key_format, "expiry": expiry_time})
-    return key_format, expiry_time
-
-def parse_duration(duration):
-    try:
-        if duration.endswith('d'):
-            return datetime.now() + timedelta(days=int(duration[:-1]))
-        elif duration.endswith('h'):
-            return datetime.now() + timedelta(hours=int(duration[:-1]))
-        elif duration.endswith('m') and not duration.endswith('mi'):
-            return datetime.now() + timedelta(minutes=int(duration[:-1]))
-        elif duration.endswith('y'):
-            return datetime.now() + timedelta(days=int(duration[:-1]) * 365)
-        elif duration.endswith('mi'):
-            return datetime.now() + timedelta(minutes=int(duration[:-2]))
-    except ValueError:
-        return None
-
-async def promote_user(user_id, duration, credits=None):
-    expiry_time = parse_duration(duration)
-    if not expiry_time:
-        return "Invalid duration format."
-
-    await authorized_users_collection.update_one(
-        {"id": user_id},
-        {"$set": {
-            "role": "authorized",
-            "rank": "VIP",
-            "expiry": expiry_time,
-            "credits": credits if credits else DEFAULT_CREDITS
-        }},
-        upsert=True
-    )
-
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": "authorized", "rank": "VIP"}}
-    )
-    return f"User {user_id} is now authorized for {duration}."
-
-async def demote_user(user_id):
-    await authorized_users_collection.delete_one({"id": user_id})
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": "free", "rank": "Free user"}}
-    )
-    return f"User {user_id} has been demoted to Free user."
-
-async def claim_key(user_id, key):
-    key_doc = await keys_collection.find_one({"key": key})
-    if not key_doc:
-        return "Key not found."
-
-    if key_doc["expiry"] < datetime.now():
-        return "Key has expired."
-
-    authorized_user = await authorized_users_collection.find_one({"id": user_id})
-    if not authorized_user:
-        await authorized_users_collection.insert_one({
-            "id": user_id,
-            "expiry": key_doc["expiry"],
-            "credits": DEFAULT_CREDITS,
-            "role": "authorized",
-            "rank": "VIP"
-        })
-
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": "authorized", "rank": "VIP"}}
-    )
-
-    await keys_collection.delete_one({"key": key})
-    return "Key successfully claimed. You are now authorized."
-
-async def unauth_user(user_id):
-    result = await authorized_users_collection.delete_one({"id": user_id})
-    if result.deleted_count == 0:
-        return f"User {user_id} is not authorized or already removed."
-
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"role": "free", "rank": "Free user"}}
-    )
-
-    return f"User {user_id} has been successfully unauthorized and is now a Free User."
-
-async def clean_expired_authorizations_and_keys():
+def check_expiry(data):
+    """Check for expired users or keys and update their status."""
     now = datetime.now()
+    changed = False
+    # Demote expired authorized users to free
+    for user in data["users"]:
+        if user["role"] == "authorized" and user["expiry"]:
+            expiry_date = datetime.fromisoformat(user["expiry"])
+            if now > expiry_date:
+                user["role"] = "free"
+                user["expiry"] = None
+                changed = True
+    # Expire active keys past their expiry date
+    for key in data["keys"]:
+        if key["status"] == "active" and key["expiry"]:
+            expiry_date = datetime.fromisoformat(key["expiry"])
+            if now > expiry_date:
+                key["status"] = "expired"
+                changed = True
+    if changed:
+        save_data(data)
 
-    expired_users = await authorized_users_collection.find({"expiry": {"$lt": now}}).to_list(length=None)
-    for user in expired_users:
-        await unauth_user(user["id"])
+# Initialize the bot (threaded=False ensures handlers run sequentially)
+bot = telebot.TeleBot(TOKEN, threaded=False)
 
-    await keys_collection.delete_many({"expiry": {"$lt": now}})
+# ---------------- Command Handlers ----------------
 
-async def is_user_authorized(user_id):
-    user = await authorized_users_collection.find_one({"id": user_id})
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    data = load_data()
+    user_id = message.from_user.id
+    # Register the user if not already present
+    if register_user(data, user_id):
+        bot.reply_to(message, "Welcome! You have been registered as a free user.")
+    else:
+        bot.reply_to(message, "Welcome back!")
+
+@bot.message_handler(commands=['profile'])
+def cmd_profile(message):
+    data = load_data()
+    user_id = message.from_user.id
+    user = find_user(data, user_id)
     if user:
-        if user.get("expiry") and user["expiry"] < datetime.now():
-            await unauth_user(user_id)
-            return False
-        return True
-    return False
+        text = f"User ID: {user['user_id']}\nRole: {user['role']}\nCredits: {user['credits']}"
+        if user['expiry']:
+            text += f"\nExpiry Date: {user['expiry']}"
+        bot.reply_to(message, text)
+    else:
+        bot.reply_to(message, "You are not registered. Send /start to register.")
 
-async def get_user_rank(user_id):
-    user = await authorized_users_collection.find_one({"id": user_id})
+@bot.message_handler(commands=['setrole'])
+def cmd_setrole(message):
+    parts = message.text.split()
+    if len(parts) < 3:
+        bot.reply_to(message, "Usage: /setrole <user_id> <role> [days]")
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid user ID.")
+        return
+    role = parts[2]
+    days = int(parts[3]) if len(parts) > 3 else None
+    data = load_data()
+    # Only the owner can set roles
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "You are not authorized to perform this action.")
+        return
+    if set_user_role(data, target_id, role, days):
+        bot.reply_to(message, f"User {target_id} role set to {role}.")
+    else:
+        bot.reply_to(message, f"User {target_id} not found.")
+
+@bot.message_handler(commands=['addcredit'])
+def cmd_addcredit(message):
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: /addcredit <user_id> <amount>")
+        return
+    try:
+        target_id = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "Invalid user ID or amount.")
+        return
+    data = load_data()
+    # Only owner can add credits
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "You are not authorized to add credits.")
+        return
+    if add_credits(data, target_id, amount):
+        bot.reply_to(message, f"Added {amount} credits to user {target_id}.")
+    else:
+        bot.reply_to(message, f"User {target_id} not found.")
+
+@bot.message_handler(commands=['generatekey'])
+def cmd_generate_key(message):
+    data = load_data()
+    user_id = message.from_user.id
+    user = find_user(data, user_id)
+    # Only owner or authorized users can generate keys
+    if user_id != OWNER_ID and (not user or user["role"] != "authorized"):
+        bot.reply_to(message, "You do not have permission to generate keys.")
+        return
+    sk, pk = generate_key_pair()
+    # (Optional: parse an expiry days parameter from message if needed)
+    expiry_days = None
+    key = add_key(data, sk, pk, expiry_days)
+    bot.reply_to(message, f"New key generated:\nSK: {sk}\nPK: {pk}")
+
+@bot.message_handler(commands=['keys'])
+def cmd_keys(message):
+    data = load_data()
+    user_id = message.from_user.id
+    user = find_user(data, user_id)
     if not user:
-        return "Free user"
-    if user.get("role") == "owner" or user == OWNER_ID:
-        return "Dev"
-    elif user.get("role") in ["authorized"]:
-        return "VIP"
-    return "Free user"
+        bot.reply_to(message, "You are not registered. Use /start.")
+        return
+    parts = message.text.split()
+    if len(parts) == 1 or parts[1].lower() == 'all':
+        # Only owner or authorized can view all keys
+        if user_id != OWNER_ID and user['role'] != 'authorized':
+            bot.reply_to(message, "You don't have permission to view all keys.")
+            return
+        text = "All keys:\n"
+        for key in data["keys"]:
+            text += f"PK: {key['pk']} (Status: {key['status']})\n"
+        bot.reply_to(message, text)
+    elif parts[1].lower() == 'mine':
+        text = "Your keys:\n"
+        for key in data["keys"]:
+            if key["claimed_by"] == user_id:
+                text += f"PK: {key['pk']} (Status: {key['status']})\n"
+        bot.reply_to(message, text)
+    else:
+        bot.reply_to(message, "Usage: /keys [all|mine]")
 
-def generate_random_string(length):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+@bot.message_handler(commands=['claim'])
+def cmd_claim(message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /claim <public_key>")
+        return
+    pk = parts[1]
+    data = load_data()
+    success, msg = claim_key(data, message.from_user.id, pk)
+    bot.reply_to(message, msg)
 
-async def assign_roles_to_all():
-    all_users = await authorized_users_collection.find().to_list(length=None)
-    for user in all_users:
-        role = "owner" if user["id"] == OWNER_ID else ("authorized" if await is_user_authorized(user["id"]) else "free")
-        rank = "Dev" if role == "owner" else ("VIP" if role == "authorized" else "Free user")
+@bot.message_handler(commands=['addgateway'])
+def cmd_add_gateway(message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Usage: /addgateway <name> <category>")
+        return
+    name = parts[1]
+    category = parts[2]
+    data = load_data()
+    user_id = message.from_user.id
+    user = find_user(data, user_id)
+    # Only owner or authorized can add a gateway
+    if user_id != OWNER_ID and (not user or user["role"] != "authorized"):
+        bot.reply_to(message, "You do not have permission to add gateways.")
+        return
+    gateway = add_gateway(data, name, category)
+    bot.reply_to(message, f"Gateway added with ID {gateway['id']}.")
 
-        await authorized_users_collection.update_one(
-            {"id": user["id"]},
-            {"$set": {"role": role, "rank": rank}}
-        )
+@bot.message_handler(commands=['gateways'])
+def cmd_list_gateways(message):
+    parts = message.text.split()
+    category = parts[1] if len(parts) > 1 else None
+    data = load_data()
+    gateways = list_gateways(data, category)
+    if not gateways:
+        bot.reply_to(message, "No gateways found.")
+        return
+    text = "Gateways:\n"
+    for gw in gateways:
+        text += f"ID: {gw['id']} Name: {gw['name']} Category: {gw['category']} Status: {gw['status']}\n"
+    bot.reply_to(message, text)
 
-        await users_collection.update_one(
-            {"user_id": user["id"]},
-            {"$set": {"role": role, "rank": rank}}
-        )
+@bot.message_handler(commands=['setgatewaystatus'])
+def cmd_set_gateway_status(message):
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.reply_to(message, "Usage: /setgatewaystatus <id> <status>")
+        return
+    try:
+        gateway_id = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "Invalid gateway ID.")
+        return
+    status = parts[2]
+    data = load_data()
+    # Only owner can change gateway status
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "You are not authorized to perform this action.")
+        return
+    if set_gateway_status(data, gateway_id, status):
+        bot.reply_to(message, f"Gateway {gateway_id} status updated to {status}.")
+    else:
+        bot.reply_to(message, f"Gateway {gateway_id} not found.")
 
-    all_users_in_db = await users_collection.find().to_list(length=None)
-    for user in all_users_in_db:
-        if not await authorized_users_collection.find_one({"id": user["user_id"]}):
-            await users_collection.update_one(
-                {"user_id": user["user_id"]},
-                {"$set": {"role": "free", "rank": "Free user"}}
-            )
-# Gateway management functions
-async def add_gateway(category, name, command, status="on"):
-    """Add a new gateway to the database or update an existing one"""
-    result = await gateways_collection.update_one(
-        {"category": category, "command": command},
-        {"$set": {
-            "category": category,
-            "name": name,
-            "command": command,
-            "status": status,
-            "updated_at": datetime.now()
-        }},
-        upsert=True
-    )
-    return result.modified_count > 0 or result.upserted_id is not None
-
-async def get_gateways_by_category(category):
-    """Get all gateways for a specific category"""
-    cursor = gateways_collection.find({"category": category})
-    return await cursor.to_list(length=None)
-
-async def get_all_gateways():
-    """Get all gateways from the database"""
-    cursor = gateways_collection.find({})
-    return await cursor.to_list(length=None)
-
-async def get_gateway_categories():
-    """Get all unique gateway categories"""
-    categories = await gateways_collection.distinct("category")
-    return categories
-
-async def update_gateway_status(command, status):
-    """Update the status of a gateway"""
-    result = await gateways_collection.update_one(
-        {"command": command},
-        {"$set": {"status": status, "updated_at": datetime.now()}}
-    )
-    return result.modified_count > 0
-
-async def delete_gateway(command):
-    """Delete a gateway from the database"""
-    result = await gateways_collection.delete_one({"command": command})
-    return result.deleted_count > 0
-
-async def get_gateway_count():
-    """Get the total number of gateways in the database"""
-    return await gateways_collection.count_documents({})
-
-async def initialize_default_gateways():
-    """Initialize the database with default gateways if empty"""
-    count = await get_gateway_count()
-    if count == 0:
-        # Default gateway data from the static dictionary
-        default_gateways = {
-            "auth": [
-                ("Braintree Auth", "/chk"),
-                ("Braintree Auth 2", "/b3"),
-                ("Braintree Auth 3", "/cc"),
-                ("Braintree Auth 4 (AVS)", "/auth"),
-                ("Braintree + Moneris Auth", "/btm"),
-                ("Moneris Auth", "/mo"),
-                ("Payflow Auth", "/lt"),
-                ("Stripe Auth", "/sa"),
-                ("Stripe Auth 2", "/sa2"),
-            ],
-            "charge": [
-                ("Braintree Charge €1" , "/bc"),
-                ("Braintree Charge $5", "/bl"),
-                ("Braintree Charge $275", "/bt"),
-                ("Braintree CCN Charge $16.20", "/bcn"),
-                ("Vantiv Charge $10", "/vc"),
-                ("Payflow Charge $14.74", "/pf"),
-                ("Payflow Charge $19.67", "/pt"),
-                ("Stripe Charge $1", "/sc"),
-                ("Stripe Charge $1.99", "/st"),
-                ("Stripe Charge £5.00", "/sx"),
-                ("Stripe Charge $5.50", "/sp"),
-                ("SK Based $1", "/sv"),
-                ("Cybersource Charge $1.53", "/scy"),
-                ("PayPal Commerce $5", "/pp"),
-                ("Auth.net Charge $4.99", "/atn"),
-                ("Shopify Charge $1", "/sh"),
-                ("Shopify Charge ₹100", "/shr"),
-                ("USAePay Charge $22.50", "/ue"),
-                ("USAePay Charge $33", "/ue2"),
-            ],
-            "mass": [
-                ("Mass Stripe Charge $2", "/mst"),
-                ("Mass Stripe Auth", "/mau"),
-                ("Mass Sk based $1", "/msv"),
-                ("Mass Stripe Charge $1", "/svtxt"),
-                ("Mass Braintree Auth", "/mb3"),
-            ],
-            "special": [
-                ("Braintree VBV Lookup", "/vbv"),
-            ]
-        }
-        
-        # Add all default gateways to the database
-        for category, gateways in default_gateways.items():
-            for name, command in gateways:
-                cmd = command[1:]  # Remove the '/' prefix
-                status = get_command_status(cmd)
-                await add_gateway(category, name, command, status)
-
-async def init():
-    await assign_roles_to_all()
-    await clean_expired_authorizations_and_keys()
-    await ensure_owner_is_authorized()
-    await initialize_default_gateways()
-    print("MongoDB connection established and initialization complete.")
+print("Bot is polling...")
+bot.infinity_polling()
