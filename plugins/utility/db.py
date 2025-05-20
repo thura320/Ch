@@ -3,6 +3,7 @@ from telebot import types
 import json
 from datetime import datetime, timedelta
 import os
+import threading
 
 # Bot token and owner ID (replace OWNER_ID with your Telegram user ID)
 TOKEN = "7939685234:AAEQkhe191nzbeqRSlVvHj0rxXV7B9lMgGo"
@@ -10,6 +11,7 @@ OWNER_ID = 6473717870  # replace with your Telegram ID
 
 # Database file path
 DB_FILE = 'db.txt'
+db_lock = threading.Lock()
 
 def load_data():
     """Load data from the database file (create default structure if missing)."""
